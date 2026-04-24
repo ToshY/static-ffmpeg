@@ -13,27 +13,50 @@ env:
 
 jobs:
   build:
-    name: Build image
+    name: Build image (${{ matrix.variant }} / ${{ matrix.tag }})
     strategy:
+      fail-fast: false
       matrix:
         include:
+          # default fully-static build, multi-arch
           - runs_on: ubicloud-standard-8-arm
             tag: arm64
+            variant: default
+            target: ""
+            build_args: ""
           - runs_on: ubuntu-latest
             tag: amd64
+            variant: default
+            target: ""
+            build_args: ""
+          # CUDA variant (NVENC/NVDEC/CUVID), amd64 only.
+          # If/when ffnvcodec is regularly tested on Jetson/arm64, add an arm64 entry.
+          - runs_on: ubuntu-latest
+            tag: amd64
+            variant: cuda
+            target: final-cuda
+            build_args: ENABLE_CUDA=1
 
     runs-on: ${{ matrix.runs_on }}
     steps:
       - uses: actions/checkout@v4
       - name: Docker build
-        run: docker build --tag image:${{ matrix.tag }} .
+        run: |
+          docker build \
+            ${{ matrix.target && format('--target {0}', matrix.target) || '' }} \
+            ${{ matrix.build_args && format('--build-arg {0}', matrix.build_args) || '' }} \
+            --tag image:${{ matrix.variant }}-${{ matrix.tag }} \
+            .
       - name: Docker save
-        run: docker image save --output image-${{ matrix.tag }}.tar image:${{ matrix.tag }}
-      - name: Upload Docker image-${{ matrix.tag }}
+        run: |
+          docker image save \
+            --output image-${{ matrix.variant }}-${{ matrix.tag }}.tar \
+            image:${{ matrix.variant }}-${{ matrix.tag }}
+      - name: Upload Docker image-${{ matrix.variant }}-${{ matrix.tag }}
         uses: actions/upload-artifact@v4
         with:
-          name: image-${{ matrix.tag }}
-          path: image-${{ matrix.tag }}.tar
+          name: image-${{ matrix.variant }}-${{ matrix.tag }}
+          path: image-${{ matrix.variant }}-${{ matrix.tag }}.tar
           retention-days: 1
 
   tag:
@@ -53,7 +76,7 @@ jobs:
           ' >> "$GITHUB_OUTPUT"
 
   merge:
-    name: Merge and push images
+    name: Merge and push default images
     runs-on: ubuntu-latest
     needs:
       - build
@@ -63,12 +86,12 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: /tmp
-          pattern: image-*
+          pattern: image-default-*
           merge-multiple: true
       - name: Load Docker images
         run: |
-          docker image load --input /tmp/image-arm64.tar
-          docker image load --input /tmp/image-amd64.tar
+          docker image load --input /tmp/image-default-arm64.tar
+          docker image load --input /tmp/image-default-amd64.tar
       - name: Docker meta
         id: meta
         uses: docker/metadata-action@v5
@@ -81,8 +104,8 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
       - name: Create manifest list and push
         run: |
-          docker tag image:arm64 ${{ env.REGISTRY_IMAGE }}:${{ needs.tag.outputs.TAG }}-arm64
-          docker tag image:amd64 ${{ env.REGISTRY_IMAGE }}:${{ needs.tag.outputs.TAG }}-amd64
+          docker tag image:default-arm64 ${{ env.REGISTRY_IMAGE }}:${{ needs.tag.outputs.TAG }}-arm64
+          docker tag image:default-amd64 ${{ env.REGISTRY_IMAGE }}:${{ needs.tag.outputs.TAG }}-amd64
           docker push ${{ env.REGISTRY_IMAGE }}:${{ needs.tag.outputs.TAG }}-arm64
           docker push ${{ env.REGISTRY_IMAGE }}:${{ needs.tag.outputs.TAG }}-amd64
           docker manifest create \
@@ -91,3 +114,32 @@ jobs:
             --amend ${{ env.REGISTRY_IMAGE }}:${{ needs.tag.outputs.TAG }}-amd64
           docker manifest inspect ${{ env.REGISTRY_IMAGE }}:${{ needs.tag.outputs.TAG }}
           docker manifest push ${{ env.REGISTRY_IMAGE }}:${{ needs.tag.outputs.TAG }}
+
+  merge-cuda:
+    name: Push CUDA image (amd64 only)
+    runs-on: ubuntu-latest
+    needs:
+      - build
+      - tag
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp
+          pattern: image-cuda-*
+          merge-multiple: true
+      - name: Load Docker image
+        run: docker image load --input /tmp/image-cuda-amd64.tar
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Tag and push CUDA image
+        run: |
+          # CUDA variant is amd64-only for now; published as a single-arch tag.
+          docker tag image:cuda-amd64 ${{ env.REGISTRY_IMAGE }}:${{ needs.tag.outputs.TAG }}-cuda-amd64
+          docker tag image:cuda-amd64 ${{ env.REGISTRY_IMAGE }}:${{ needs.tag.outputs.TAG }}-cuda
+          docker push ${{ env.REGISTRY_IMAGE }}:${{ needs.tag.outputs.TAG }}-cuda-amd64
+          docker push ${{ env.REGISTRY_IMAGE }}:${{ needs.tag.outputs.TAG }}-cuda
+

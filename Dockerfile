@@ -1037,6 +1037,27 @@ RUN \
     --enable-static && \
   make -j$(nproc) install
 
+# NVIDIA codec headers (header-only stubs for NVENC / NVDEC / CUVID / CUDA driver API).
+# These do NOT pull in the CUDA toolkit or any glibc-only NVIDIA libraries; ffmpeg
+# dlopen()s libcuda.so.1 / libnvcuvid.so / libnvidia-encode.so at runtime, which are
+# injected into the container by the NVIDIA Container Toolkit (`docker run --gpus all`).
+# Only built when ENABLE_CUDA is set; the resulting ffmpeg binary in that case is a
+# musl dynamic-PIE (not -static-pie) so the loader is present and dlopen() works.
+# bump: ffnvcodec /FFNVCODEC_VERSION=([\d.]+)/ https://github.com/FFmpeg/nv-codec-headers.git|^13
+# bump: ffnvcodec after ./hashupdate Dockerfile FFNVCODEC $LATEST
+# bump: ffnvcodec link "Releases" https://github.com/FFmpeg/nv-codec-headers/releases
+ARG FFNVCODEC_VERSION=13.0.19.0
+ARG FFNVCODEC_URL="https://github.com/FFmpeg/nv-codec-headers/archive/refs/tags/n${FFNVCODEC_VERSION}.tar.gz"
+ARG FFNVCODEC_SHA256=62b30ab37e4e9be0d0b8b6a8e5fee71b8c4c8a2671ff39fb0a25e7a501f4e2b0
+ARG ENABLE_CUDA=
+RUN \
+  if [ -n "$ENABLE_CUDA" ]; then \
+    wget $WGET_OPTS -O ffnvcodec.tar.gz "$FFNVCODEC_URL" && \
+    echo "$FFNVCODEC_SHA256  ffnvcodec.tar.gz" | sha256sum -c - && \
+    tar $TAR_OPTS ffnvcodec.tar.gz && cd nv-codec-headers-* && \
+    make PREFIX=/usr/local install ; \
+  fi
+
 # requires libdrm
 # bump: libva /LIBVA_VERSION=([\d.]+)/ https://github.com/intel/libva.git|^2
 # bump: libva after ./hashupdate Dockerfile LIBVA $LATEST
@@ -1114,6 +1135,12 @@ ARG FFMPEG_SHA256=c07039598df7d64d3c8b42c4e25b1959fc908621c6f6c2946881133f3b27ed
 ARG ENABLE_FDKAAC=
 # sed changes --toolchain=hardened -pie to -static-pie
 #
+# When ENABLE_CUDA is set we KEEP -pie (i.e. skip the -static-pie rewrite) so the
+# resulting binary is a musl dynamic-PIE. This is required because ffnvcodec dlopen()s
+# the NVIDIA driver libs at runtime, and a fully static-pie binary on musl has no
+# dynamic loader → dlopen() always fails. All other dependencies remain statically
+# archived; only ld-musl-*.so.1 / libc.musl-*.so.1 stay dynamic.
+#
 # ldflags stack-size=2097152 is to increase default stack size from 128KB (musl default) to something
 # more similar to glibc (2MB). This fixing segfault with libaom-av1 and libsvtav1 as they seems to pass
 # large things on the stack.
@@ -1125,7 +1152,10 @@ RUN \
   echo "$FFMPEG_SHA256  ffmpeg.tar.bz2" | sha256sum -c - && \
   tar $TAR_OPTS ffmpeg.tar.bz2 && cd ffmpeg* && \
   FDKAAC_FLAGS=$(if [[ -n "$ENABLE_FDKAAC" ]] ;then echo " --enable-libfdk-aac --enable-nonfree " ;else echo ""; fi) && \
-  sed -i 's/add_ldexeflags -fPIE -pie/add_ldexeflags -fPIE -static-pie/' configure && \
+  CUDA_FLAGS=$(if [[ -n "$ENABLE_CUDA" ]] ;then echo " --enable-ffnvcodec --enable-cuvid --enable-nvenc --enable-nvdec " ;else echo ""; fi) && \
+  if [[ -z "$ENABLE_CUDA" ]]; then \
+    sed -i 's/add_ldexeflags -fPIE -pie/add_ldexeflags -fPIE -static-pie/' configure ; \
+  fi && \
   ./configure \
   --pkg-config-flags="--static" \
   --extra-cflags="-fopenmp" \
@@ -1138,6 +1168,7 @@ RUN \
   --enable-gpl \
   --enable-version3 \
   $FDKAAC_FLAGS \
+  $CUDA_FLAGS \
   --enable-fontconfig \
   --enable-gray \
   --enable-iconv \
@@ -1273,13 +1304,18 @@ RUN \
   libzimg: env.ZIMG_VERSION, \
   libzmq: env.LIBZMQ_VERSION, \
   openssl: env.OPENSSL_VERSION, \
+  ffnvcodec: env.FFNVCODEC_VERSION, \
   }' > /versions.json
 
 # make sure binaries has no dependencies, is relro, pie and stack nx
+# When ENABLE_CUDA is set the binaries are musl dynamic-PIE (so dlopen() of NVIDIA
+# driver libs works at runtime); checkelf is invoked with --cuda which only allows
+# the musl loader / libc as NEEDED entries.
 COPY checkelf /
 RUN \
-  /checkelf /usr/local/bin/ffmpeg && \
-  /checkelf /usr/local/bin/ffprobe
+  CHECKELF_FLAGS=$(if [ -n "$ENABLE_CUDA" ]; then echo "--cuda"; fi) && \
+  /checkelf $CHECKELF_FLAGS /usr/local/bin/ffmpeg && \
+  /checkelf $CHECKELF_FLAGS /usr/local/bin/ffprobe
 # workaround for using -Wl,--allow-multiple-definition
 # see comment in checkdupsym for details
 COPY checkdupsym /
@@ -1320,6 +1356,42 @@ RUN ["/ffmpeg", "-f", "lavfi", "-i", "testsrc", "-c:v", "libx265", "-t", "100ms"
 FROM scratch AS final2
 COPY --from=final1 / /
 
-FROM final2
+FROM final2 AS final
 LABEL maintainer="Mattias Wadman mattias.wadman@gmail.com"
+ENTRYPOINT ["/ffmpeg"]
+
+# CUDA / NVENC / NVDEC variant.
+#
+# Build with:
+#   docker build --build-arg ENABLE_CUDA=1 --target final-cuda -t mwader/static-ffmpeg:<ver>-cuda .
+#
+# Run with (requires NVIDIA driver on host + nvidia-container-toolkit):
+#   docker run --gpus all -i --rm -v "$PWD:$PWD" -w "$PWD" mwader/static-ffmpeg:<ver>-cuda \
+#     -hwaccel cuda -hwaccel_output_format cuda -i in.mp4 -c:v h264_nvenc out.mp4
+#
+# The binary is a musl dynamic-PIE (NOT fully static-pie) so the dynamic loader is
+# present and FFmpeg can dlopen() the NVIDIA driver libraries (libcuda.so.1,
+# libnvcuvid.so, libnvidia-encode.so) which the NVIDIA Container Toolkit injects
+# into the container at runtime. No CUDA toolkit is required to build or run.
+#
+# Note: --enable-libnpp / --enable-cuda-nvcc are NOT included as they require the
+# full glibc-based CUDA toolkit; if you need scale_npp use scale_cuda instead.
+FROM alpine:3.20.3 AS final-cuda
+LABEL maintainer="Mattias Wadman mattias.wadman@gmail.com"
+COPY --from=builder /usr/local/bin/ffmpeg /
+COPY --from=builder /usr/local/bin/ffprobe /
+COPY --from=builder /versions.json /
+COPY --from=builder /usr/local/share/doc/ffmpeg/* /doc/
+COPY --from=builder /etc/ssl/cert.pem /etc/ssl/cert.pem
+COPY --from=builder /etc/fonts/ /etc/fonts/
+COPY --from=builder /usr/share/fonts/ /usr/share/fonts/
+COPY --from=builder /usr/share/consolefonts/ /usr/share/consolefonts/
+COPY --from=builder /var/cache/fontconfig/ /var/cache/fontconfig/
+# sanity tests (cannot exercise actual GPU encode without a GPU at build time)
+RUN ["/ffmpeg", "-version"]
+RUN ["/ffprobe", "-version"]
+RUN ["/ffmpeg", "-hide_banner", "-buildconf"]
+RUN /ffmpeg -hide_banner -hwaccels 2>&1 | grep -q cuda
+RUN /ffmpeg -hide_banner -encoders 2>&1 | grep -q nvenc
+RUN /ffmpeg -hide_banner -decoders 2>&1 | grep -q cuvid
 ENTRYPOINT ["/ffmpeg"]
