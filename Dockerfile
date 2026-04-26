@@ -1048,7 +1048,7 @@ RUN \
 # bump: ffnvcodec link "Releases" https://github.com/FFmpeg/nv-codec-headers/releases
 ARG FFNVCODEC_VERSION=13.0.19.0
 ARG FFNVCODEC_URL="https://github.com/FFmpeg/nv-codec-headers/archive/refs/tags/n${FFNVCODEC_VERSION}.tar.gz"
-ARG FFNVCODEC_SHA256=62b30ab37e4e9be0d0b8b6a8e5fee71b8c4c8a2671ff39fb0a25e7a501f4e2b0
+ARG FFNVCODEC_SHA256=86d15d1a7c0ac73a0eafdfc57bebfeba7da8264595bf531cf4d8db1c22940116
 ARG ENABLE_CUDA=
 RUN \
   if [ -n "$ENABLE_CUDA" ]; then \
@@ -1151,83 +1151,88 @@ RUN \
   wget $WGET_OPTS -O ffmpeg.tar.bz2 "$FFMPEG_URL" && \
   echo "$FFMPEG_SHA256  ffmpeg.tar.bz2" | sha256sum -c - && \
   tar $TAR_OPTS ffmpeg.tar.bz2 && cd ffmpeg* && \
+  export LDFLAGS="-Wl,--no-as-needed -Wl,-Bdynamic -lc" && \
   FDKAAC_FLAGS=$(if [[ -n "$ENABLE_FDKAAC" ]] ;then echo " --enable-libfdk-aac --enable-nonfree " ;else echo ""; fi) && \
   CUDA_FLAGS=$(if [[ -n "$ENABLE_CUDA" ]] ;then echo " --enable-ffnvcodec --enable-cuvid --enable-nvenc --enable-nvdec " ;else echo ""; fi) && \
   if [[ -z "$ENABLE_CUDA" ]]; then \
     sed -i 's/add_ldexeflags -fPIE -pie/add_ldexeflags -fPIE -static-pie/' configure ; \
   fi && \
   ./configure \
-  --pkg-config-flags="--static" \
-  --extra-cflags="-fopenmp" \
-  --extra-ldflags="-fopenmp -Wl,--allow-multiple-definition -Wl,-z,stack-size=2097152" \
-  --toolchain=hardened \
-  --disable-debug \
-  --disable-shared \
-  --disable-ffplay \
-  --enable-static \
-  --enable-gpl \
-  --enable-version3 \
-  $FDKAAC_FLAGS \
-  $CUDA_FLAGS \
-  --enable-fontconfig \
-  --enable-gray \
-  --enable-iconv \
-  --enable-lcms2 \
-  --enable-libaom \
-  --enable-libaribb24 \
-  --enable-libass \
-  --enable-libbluray \
-  --enable-libdav1d \
-  --enable-libdavs2 \
-  --enable-libfreetype \
-  --enable-libfribidi \
-  --enable-libgme \
-  --enable-libgsm \
-  --enable-libharfbuzz \
-  --enable-libjxl \
-  --enable-libkvazaar \
-  --enable-libmodplug \
-  --enable-libmp3lame \
-  --enable-libmysofa \
-  --enable-libopencore-amrnb \
-  --enable-libopencore-amrwb \
-  --enable-libopenjpeg \
-  --enable-libopus \
-  --enable-librabbitmq \
-  --enable-librav1e \
-  --enable-librsvg \
-  --enable-librtmp \
-  --enable-librubberband \
-  --enable-libshine \
-  --enable-libsnappy \
-  --enable-libsoxr \
-  --enable-libspeex \
-  --enable-libsrt \
-  --enable-libssh \
-  --enable-libsvtav1 \
-  --enable-libtheora \
-  --enable-libtwolame \
-  --enable-libuavs3d \
-  --enable-libvidstab \
-  --enable-libvmaf \
-  --enable-libvo-amrwbenc \
-  --enable-libvorbis \
-  --enable-libvpl \
-  --enable-libvpx \
-  --enable-libvvenc \
-  --enable-libwebp \
-  --enable-libx264 \
-  --enable-libx265 \
-  --enable-libxavs2 \
-  --enable-libxevd \
-  --enable-libxeve \
-  --enable-libxml2 \
-  --enable-libxvid \
-  --enable-libzimg \
-  --enable-libzmq \
-  --enable-openssl \
-  || (cat ffbuild/config.log ; false) \
-  && make -j$(nproc) install
+    --pkg-config-flags="--static" \
+    --extra-cflags="-fopenmp" \
+    --extra-ldflags="-fopenmp -Wl,--allow-multiple-definition -Wl,-z,stack-size=2097152 \
+    -Wl,--as-needed -Wl,-Bstatic \
+    -static-libstdc++ -static-libgcc" \
+    --extra-libs="-lgomp" \
+    --toolchain=hardened \
+    --disable-debug \
+    --disable-shared \
+    --disable-ffplay \
+    --enable-static \
+    --enable-gpl \
+    --enable-version3 \
+    $FDKAAC_FLAGS \
+    $CUDA_FLAGS \
+    --enable-openssl \
+  || (cat ffbuild/config.log ; false) && \
+  make -j$(nproc) install
+
+#    --enable-fontconfig \
+#    --enable-gray \
+#    --enable-iconv \
+#    --enable-lcms2 \
+#    --enable-libaom \
+#    --enable-libaribb24 \
+#    --enable-libass \
+#    --enable-libbluray \
+#    --enable-libdav1d \
+#    --enable-libdavs2 \
+#    --enable-libfreetype \
+#    --enable-libfribidi \
+#    --enable-libgme \
+#    --enable-libgsm \
+#    --enable-libharfbuzz \
+#    --enable-libjxl \
+#    --enable-libkvazaar \
+#    --enable-libmodplug \
+#    --enable-libmp3lame \
+#    --enable-libmysofa \
+#    --enable-libopencore-amrnb \
+#    --enable-libopencore-amrwb \
+#    --enable-libopenjpeg \
+#    --enable-libopus \
+#    --enable-librabbitmq \
+#    --enable-librav1e \
+#    --enable-librsvg \
+#    --enable-librtmp \
+#    --enable-librubberband \
+#    --enable-libshine \
+#    --enable-libsnappy \
+#    --enable-libsoxr \
+#    --enable-libspeex \
+#    --enable-libsrt \
+#    --enable-libssh \
+#    --enable-libsvtav1 \
+#    --enable-libtheora \
+#    --enable-libtwolame \
+#    --enable-libuavs3d \
+#    --enable-libvidstab \
+#    --enable-libvmaf \
+#    --enable-libvo-amrwbenc \
+#    --enable-libvorbis \
+#    --enable-libvpl \
+#    --enable-libvpx \
+#    --enable-libvvenc \
+#    --enable-libwebp \
+#    --enable-libx264 \
+#    --enable-libx265 \
+#    --enable-libxavs2 \
+#    --enable-libxevd \
+#    --enable-libxeve \
+#    --enable-libxml2 \
+#    --enable-libxvid \
+#    --enable-libzimg \
+#    --enable-libzmq \
 
 RUN \
   EXPAT_VERSION=$(pkg-config --modversion expat) \
