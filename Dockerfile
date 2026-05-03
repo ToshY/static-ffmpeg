@@ -1037,12 +1037,10 @@ RUN \
     --enable-static && \
   make -j$(nproc) install
 
-# NVIDIA codec headers (header-only stubs for NVENC / NVDEC / CUVID / CUDA driver API).
-# These do NOT pull in the CUDA toolkit or any glibc-only NVIDIA libraries; ffmpeg
-# dlopen()s libcuda.so.1 / libnvcuvid.so / libnvidia-encode.so at runtime, which are
-# injected into the container by the NVIDIA Container Toolkit (`docker run --gpus all`).
-# Only built when ENABLE_CUDA is set; the resulting ffmpeg binary in that case is a
-# musl dynamic-PIE (not -static-pie) so the loader is present and dlopen() works.
+# NVIDIA codec headers (header-only; no CUDA toolkit needed). ffmpeg dlopen()s the
+# real driver libs (libcuda / libnvcuvid / libnvidia-encode) at runtime, injected
+# by the NVIDIA Container Toolkit. Only built when ENABLE_CUDA is set.
+# See docs/ffmpeg-with-cuda.md.
 # bump: ffnvcodec /FFNVCODEC_VERSION=([\d.]+)/ https://github.com/FFmpeg/nv-codec-headers.git|^13
 # bump: ffnvcodec after ./hashupdate Dockerfile FFNVCODEC $LATEST
 # bump: ffnvcodec link "Releases" https://github.com/FFmpeg/nv-codec-headers/releases
@@ -1133,20 +1131,16 @@ ARG FFMPEG_VERSION=8.1
 ARG FFMPEG_URL="https://ffmpeg.org/releases/ffmpeg-$FFMPEG_VERSION.tar.bz2"
 ARG FFMPEG_SHA256=c07039598df7d64d3c8b42c4e25b1959fc908621c6f6c2946881133f3b27eda2
 ARG ENABLE_FDKAAC=
-# sed changes --toolchain=hardened -pie to -static-pie
+# sed changes --toolchain=hardened -pie to -static-pie (default build only).
 #
-# When ENABLE_CUDA is set we KEEP -pie (i.e. skip the -static-pie rewrite) so the
-# resulting binary is a musl dynamic-PIE. This is required because ffnvcodec dlopen()s
-# the NVIDIA driver libs at runtime, and a fully static-pie binary on musl has no
-# dynamic loader → dlopen() always fails. All other dependencies remain statically
-# archived; only ld-musl-*.so.1 / libc.musl-*.so.1 stay dynamic.
+# CUDA variant: keep -pie (musl dynamic-PIE) so ffnvcodec can dlopen() the
+# NVIDIA driver libs. All other deps stay statically archived; only the musl
+# loader/libc is dynamic. See docs/ffmpeg-with-cuda.md.
 #
-# ldflags stack-size=2097152 is to increase default stack size from 128KB (musl default) to something
-# more similar to glibc (2MB). This fixing segfault with libaom-av1 and libsvtav1 as they seems to pass
-# large things on the stack.
-#
-# ldfalgs -Wl,--allow-multiple-definition is a workaround for linking with multiple rust staticlib to
-# not cause collision in toolchain symbols, see comment in checkdupsym script for details.
+# ldflags stack-size=2097152 raises musl's 128KB default to ~glibc 2MB
+# (libaom/libsvtav1 pass large objects on the stack).
+# ldflags --allow-multiple-definition works around rust staticlib toolchain
+# symbol collisions (see checkdupsym).
 RUN \
   wget $WGET_OPTS -O ffmpeg.tar.bz2 "$FFMPEG_URL" && \
   echo "$FFMPEG_SHA256  ffmpeg.tar.bz2" | sha256sum -c - && \
@@ -1154,32 +1148,17 @@ RUN \
   FDKAAC_FLAGS=$(if [[ -n "$ENABLE_FDKAAC" ]] ;then echo " --enable-libfdk-aac --enable-nonfree " ;else echo ""; fi) && \
   CUDA_FLAGS=$(if [[ -n "$ENABLE_CUDA" ]] ;then echo " --enable-ffnvcodec --enable-cuvid --enable-nvenc --enable-nvdec " ;else echo ""; fi) && \
   if [[ -z "$ENABLE_CUDA" ]]; then \
-    # Default static-pie build: rewrite the hardened toolchain link flag so the
-    # final binaries are fully static PIE musl executables (no loader, no libc.so).
-    # dlopen is irrelevant in this branch (no GPU support), so plain -Bstatic is fine.
+    # Default: fully static-pie musl binary, no loader, no dlopen.
     sed -i 's/add_ldexeflags -fPIE -pie/add_ldexeflags -fPIE -static-pie/' configure ; \
-    EXTRA_LDFLAGS="-fopenmp -Wl,--allow-multiple-definition -Wl,-z,stack-size=2097152 \
-        -Wl,--as-needed -Wl,-Bstatic \
-        -static-libstdc++ -static-libgcc" ; \
-    EXTRA_LIBS="-lgomp" ; \
+    EXTRA_LDFLAGS="-fopenmp -Wl,--allow-multiple-definition -Wl,-z,stack-size=2097152" ; \
+    EXTRA_LIBS="" ; \
   else \
-    # CUDA variant: musl dynamic-PIE so the loader is present and ffmpeg can
-    # dlopen() libcuda.so.1 / libnvcuvid.so.1 / libnvidia-encode.so.1 that the
-    # NVIDIA Container Toolkit injects at runtime.
-    #
-    # CRITICAL — musl dlopen-stub trap (see docs/24-04-2026-ffmpeg-with-cuda.md §6):
-    #   musl's static libc.a contains a 25-byte dlopen() stub that always returns
-    #   NULL with ENOSYS. If we link the binary with bare "-Wl,-Bstatic ... codecs",
-    #   the linker satisfies ffmpeg's references to dlopen / dlsym / dlerror /
-    #   dlclose from that stub, NOT from the dynamic libc. The resulting binary
-    #   has a defined 25-byte "dlopen" symbol in .text instead of a UND PLT entry,
-    #   and h264_nvenc fails at runtime with "Cannot load libcuda.so.1" without
-    #   ever issuing an openat() syscall (verified with strace).
-    #
-    # Fix: explicitly link the dynamic libc by ABSOLUTE PATH (not -lc), so the
-    # linker uses libc.musl-x86_64.so.1 regardless of the current -B* mode and
-    # cannot fall back to libc.a's stub. Wrapped in --no-as-needed so it stays
-    # in DT_NEEDED even though ffmpeg.o doesn't directly reference its data.
+    # CUDA: musl dynamic-PIE. Link the dynamic libc by ABSOLUTE PATH (not -lc)
+    # to avoid musl's libc.a 25-byte dlopen() stub that always returns NULL —
+    # gcc's hardened toolchain can otherwise resolve dlopen/dlsym/dlerror from
+    # the static archive even when -Bdynamic is requested, breaking nvenc with
+    # a silent "Cannot load libcuda.so.1" (no openat syscall fires).
+    # See docs/ffmpeg-with-cuda.md (P1).
     EXTRA_LDFLAGS="-fopenmp -Wl,--allow-multiple-definition -Wl,-z,stack-size=2097152 \
         -Wl,--no-as-needed,/lib/ld-musl-x86_64.so.1,--as-needed \
         -Wl,--as-needed -Wl,-Bstatic \
@@ -1338,10 +1317,9 @@ RUN \
   ffnvcodec: env.FFNVCODEC_VERSION, \
   }' > /versions.json
 
-# make sure binaries has no dependencies, is relro, pie and stack nx
-# When ENABLE_CUDA is set the binaries are musl dynamic-PIE (so dlopen() of NVIDIA
-# driver libs works at runtime); checkelf is invoked with --cuda which only allows
-# the musl loader / libc as NEEDED entries.
+# make sure binaries has no dependencies, is relro, pie and stack nx.
+# CUDA build is musl dynamic-PIE; --cuda allows the musl loader/libc as the
+# only NEEDED entry.
 COPY checkelf /
 RUN \
   CHECKELF_FLAGS=$(if [ -n "$ENABLE_CUDA" ]; then echo "--cuda"; fi) && \
@@ -1391,24 +1369,20 @@ FROM final2 AS final
 LABEL maintainer="Mattias Wadman mattias.wadman@gmail.com"
 ENTRYPOINT ["/ffmpeg"]
 
-# CUDA / NVENC / NVDEC variant.
+# CUDA / NVENC / NVDEC variant. See docs/ffmpeg-with-cuda.md for full design.
 #
-# Build with:
-#   docker build --build-arg ENABLE_CUDA=1 --target final-cuda -t mwader/static-ffmpeg:<ver>-cuda .
+# Build:  docker build --build-arg ENABLE_CUDA=1 --target final-cuda -t mwader/static-ffmpeg:<ver>-cuda .
+# Run:    docker run --gpus all --rm mwader/static-ffmpeg:<ver>-cuda \
+#             -hwaccel cuda -hwaccel_output_format cuda -i in.mp4 -c:v h264_nvenc out.mp4
 #
-# Run with (requires NVIDIA driver on host + nvidia-container-toolkit):
-#   docker run --gpus all -i --rm -v "$PWD:$PWD" -w "$PWD" mwader/static-ffmpeg:<ver>-cuda \
-#     -hwaccel cuda -hwaccel_output_format cuda -i in.mp4 -c:v h264_nvenc out.mp4
+# Requires NVIDIA driver on host + nvidia-container-toolkit. The binary is a musl
+# dynamic-PIE so the loader is present and the NVIDIA driver libs (libcuda.so.1,
+# libnvcuvid.so, libnvidia-encode.so) injected by the toolkit can be dlopen()'d.
+# No CUDA toolkit needed at build or run time.
 #
-# The binary is a musl dynamic-PIE (NOT fully static-pie) so the dynamic loader is
-# present and FFmpeg can dlopen() the NVIDIA driver libraries (libcuda.so.1,
-# libnvcuvid.so, libnvidia-encode.so) which the NVIDIA Container Toolkit injects
-# into the container at runtime. No CUDA toolkit is required to build or run.
-#
-# Note: --enable-libnpp / --enable-cuda-nvcc are NOT included as they require the
-# full glibc-based CUDA toolkit; if you need scale_npp use scale_cuda instead.
-FROM alpine:3.20.3 AS final-cuda
-LABEL maintainer="Mattias Wadman mattias.wadman@gmail.com"
+# --enable-libnpp / --enable-cuda-nvcc are NOT included (require glibc CUDA toolkit).
+# Use scale_cuda instead of scale_npp.
+FROM alpine:3.20.3 AS final-cuda1
 COPY --from=builder /usr/local/bin/ffmpeg /
 COPY --from=builder /usr/local/bin/ffprobe /
 COPY --from=builder /versions.json /
@@ -1419,51 +1393,24 @@ COPY --from=builder /usr/share/fonts/ /usr/share/fonts/
 COPY --from=builder /usr/share/consolefonts/ /usr/share/consolefonts/
 COPY --from=builder /var/cache/fontconfig/ /var/cache/fontconfig/
 
-# gcompat = glibc compatibility shim for musl. Required because the NVIDIA driver
-# libraries injected by the Container Toolkit (libcuda.so.1, libnvcuvid.so.1,
-# libnvidia-encode.so.1, libnvidia-ml.so.1, ...) are built against glibc and have
+# gcompat: glibc->musl shim. NVIDIA driver libs are built against glibc and have
 # DT_NEEDED entries for libc.so.6 / libpthread.so.0 / libdl.so.2 / libm.so.6 /
-# librt.so.1 / libgcc_s.so.1 — none of which exist on Alpine/musl. gcompat
-# provides those SONAMEs as thin wrappers over musl, allowing dlopen() to succeed.
-# libstdc++ is also pulled in because some NVIDIA helper libs (e.g. libnvidia-ngx,
-# certain optical-flow / ngx variants) link against it.
+# librt.so.1 — gcompat provides those SONAMEs as musl wrappers. libstdc++ is
+# pulled in for NVIDIA helper libs (e.g. libnvidia-ngx). gcompat omits libdl.so.2
+# (musl folds dlopen into libc) so symlink it manually.
 RUN apk add --no-cache gcompat libstdc++ && \
-    # gcompat omits libdl.so.2 (musl folds dlopen into libc). The NVIDIA driver
-    # has DT_NEEDED libdl.so.2, so symlink it to libgcompat to satisfy the loader.
     ln -sf libgcompat.so.0 /lib/libdl.so.2
 
-# nvshim = tiny LD_PRELOAD library that:
+# nvshim: tiny LD_PRELOAD library exporting glibc-internal symbols that gcompat
+# does NOT provide but the real NVIDIA driver backend calls during cuInit().
+# Without these, the stub libcuda dlopens fine but its backend fails with
+# "Error relocating: <sym>: symbol not found", which ffmpeg surfaces as the
+# misleading "Cannot load libcuda.so.1".
 #
-#   (a) exports glibc-internal symbols which gcompat does NOT provide but which the
-#       real NVIDIA WSL/Linux driver backend (/usr/lib/wsl/drivers/.../libcuda.so.1.1
-#       on WSL2, libcuda.so.1 directly on bare Linux) calls during cuInit().
-#       Without these the stub libcuda dlopen succeeds but its backend-load fails
-#       with "Error relocating: <sym>: symbol not found", which ffmpeg then surfaces
-#       as the misleading "Cannot load libcuda.so.1".
-#
-#   (b) [REMOVED 2026-05-03] An earlier version of this shim also interposed
-#       exit(3) and registered an atexit handler that called _exit() to skip
-#       libcuda's crashing DT_FINI destructors. That hack was structurally
-#       broken: ffmpeg's error paths return from main() with a nonzero status
-#       rather than calling exit() explicitly, so musl's _start invokes its
-#       internal exit() WITHOUT going through the PLT — bypassing our LD_PRELOAD
-#       interpose. Our atexit handler then fired with a stale saved_status of 0
-#       and clobbered every nonzero exit code (bad codec → 0, bad input → 0).
-#       The teardown SIGSEGV is now handled exclusively by the bash entrypoint
-#       wrapper at /usr/local/bin/ffmpeg-cuda-entrypoint, which converts the
-#       benign 139 to 0 only when no error keyword is present in stderr. Real
-#       failure exit codes propagate unchanged.
-#
-# Symbols covered for (a) — broadest set of glibc-internals NVIDIA driver libs are
-# known to reference; safe no-op or thin musl-redirect implementations:
-#   gnu_get_libc_version        - sanity-check string ("2.35" satisfies all current drivers)
-#   gnu_get_libc_release        - "stable"
-#   __libc_current_sigrtmin/max - musl macros, just expose as functions
-#   __register_atfork           - glibc internal backing pthread_atfork; redirect
-#   __libc_single_threaded      - data symbol some drivers test (0 = multi-threaded path)
-#   __cxa_thread_atexit_impl    - C++ thread-local destructors registration; no-op
-#   secure_getenv               - musl already has it but some old drivers want explicit
-#   dlmopen / dlvsym / __libc_dl* - glibc-only dl* variants, redirect to musl equivalents
+# IMPORTANT: this shim must NOT interpose exit / _exit / _Exit. Doing so
+# silently swallows ffmpeg's real exit codes (every error returns 0).
+# Process-lifecycle policy belongs in the bash entrypoint wrapper below.
+# See docs/ffmpeg-with-cuda.md (P6).
 RUN apk add --no-cache --virtual .nvshim-build gcc musl-dev && \
     mkdir -p /usr/local/lib && \
     printf '%s\n' \
@@ -1486,18 +1433,16 @@ RUN apk add --no-cache --virtual .nvshim-build gcc musl-dev && \
       '    (void)f; (void)o; (void)dso; return 0;' \
       '}' \
       'char *secure_getenv(const char *name) { return getenv(name); }' \
-      '/* dlmopen is a glibc-only namespaced dlopen; musl has no link namespaces. */' \
-      '/* Fallback to regular dlopen, ignoring the Lmid_t. Works for NVIDIA driver  */' \
-      '/* which uses dlmopen mostly for symbol isolation when loading sub-modules.  */' \
+      '/* dlmopen: glibc-only namespaced dlopen; musl has no link namespaces. */' \
       'typedef long Lmid_t;' \
       'void *dlmopen(Lmid_t lmid, const char *file, int mode) {' \
       '    (void)lmid; return dlopen(file, mode);' \
       '}' \
-      '/* Glibc-internal dlopen/dlsym variants used by nss / driver init paths. */' \
+      '/* glibc-internal dl* variants used by nss / driver init. */' \
       'void *__libc_dlopen_mode(const char *name, int mode) { return dlopen(name, mode); }' \
       'void *__libc_dlsym(void *handle, const char *name) { return dlsym(handle, name); }' \
       'int   __libc_dlclose(void *handle) { return dlclose(handle); }' \
-      '/* dlvsym = glibc versioned dlsym. musl has no symbol versioning; ignore version. */' \
+      '/* dlvsym: glibc versioned dlsym; musl has no symbol versioning. */' \
       'void *dlvsym(void *handle, const char *name, const char *version) {' \
       '    (void)version; return dlsym(handle, name);' \
       '}' \
@@ -1506,50 +1451,22 @@ RUN apk add --no-cache --virtual .nvshim-build gcc musl-dev && \
     rm /tmp/nvshim.c && \
     apk del .nvshim-build
 
-# Add NVIDIA driver injection paths to musl's dynamic-loader fallback search list.
-# The NVIDIA Container Toolkit places libcuda.so.1 etc. in one of these locations
-# depending on host distro:
-#   /usr/lib64                       (RHEL / CentOS / Fedora / Rocky / openSUSE / WSL)
-#   /usr/lib/x86_64-linux-gnu        (Debian / Ubuntu)
-#   /usr/lib/wsl/lib                 (WSL2 GPU passthrough alt path)
-# musl's default search path is /lib:/usr/local/lib:/usr/lib only, so dlopen("libcuda.so.1")
-# would otherwise fail with "Cannot load libcuda.so.1" even though the file is mounted.
+# musl loader fallback search path. The NVIDIA Container Toolkit injects driver
+# libs into one of these depending on host distro; musl's defaults
+# (/lib:/usr/local/lib:/usr/lib) miss all three.
 RUN printf '/lib\n/usr/local/lib\n/usr/lib\n/usr/lib64\n/usr/lib/x86_64-linux-gnu\n/usr/lib/wsl/lib\n' \
     > /etc/ld-musl-x86_64.path
 
-# Default NVIDIA Container Toolkit env vars so callers only need `--gpus all`.
-# compute  -> mounts the real libcuda.so.1
-# video    -> mounts libnvcuvid.so.1 / libnvidia-encode.so.1 (required for NVENC/NVDEC)
-# utility  -> mounts libnvidia-ml + nvidia-smi
-# LD_PRELOAD pulls in the nvshim providing glibc-internal symbols the driver needs.
-ENV NVIDIA_VISIBLE_DEVICES=all \
-    NVIDIA_DRIVER_CAPABILITIES=compute,video,utility \
-    LD_PRELOAD=/usr/local/lib/libnvshim.so
 
-# Entrypoint wrapper to suppress benign teardown SIGSEGV from NVIDIA driver dtors.
-#
-# Background: when ffmpeg encodes/decodes through CUDA on Alpine/musl, the encode
-# itself completes successfully and all output bytes are flushed, but at process
-# teardown libcuda's __cxa_finalize / DT_FINI runs glibc-style destructors that
-# unwind through state musl + gcompat don't fully provide, producing a SIGSEGV
-# (exit 139). The crash happens INSIDE main() during avcodec_close -> cuCtxDestroy,
-# before any atexit handler we could install would fire. There is no in-process
-# fix available short of patching libcuda (closed source) or ffmpeg's nvenc.c to
-# leak the CUDA context.
-#
-# Heuristic: convert exit=139 → 0 IFF stderr contains no recognisable ffmpeg
-# error keywords. If ffmpeg printed a real error before crashing (Cannot load,
-# "Error opening", "not found", etc.) we propagate 139 so users see real bugs.
-# Works regardless of -loglevel: silent successful encode + teardown crash =
-# empty stderr = suppressed; any real failure = error keyword present = passed
-# through. Stdout (e.g. -f null - or muxed bytes for `-f mpegts -`) is preserved
-# bit-exact via fd swap; user's stderr stream gets a live tee of ffmpeg stderr.
+# Entrypoint wrapper: convert the benign teardown SIGSEGV (139 -> 0) that
+# libcuda's __cxa_finalize triggers under musl + gcompat. The crash happens
+# inside main() after the encode is complete and all output is flushed, so
+# no in-process hook can suppress it. Heuristic: only downgrade 139 when
+# stderr contains no recognisable error keyword. Real failure exit codes
+# (1, 8, 254, ...) propagate unchanged. See docs/ffmpeg-with-cuda.md (P5).
 RUN apk add --no-cache bash && \
     printf '%s\n' \
     '#!/bin/bash' \
-    '# ffmpeg-cuda entrypoint: swallow benign teardown SIGSEGV from libcuda dtors' \
-    '# (exit 139 -> 0) only when no error keyword appears in stderr. Real failure' \
-    '# exit codes (1, 8, 254, ...) propagate unchanged.' \
     'errfile=$(mktemp)' \
     'shellerr=$(mktemp)' \
     'trap "rm -f \"$errfile\" \"$shellerr\"" EXIT' \
@@ -1560,9 +1477,7 @@ RUN apk add --no-cache bash && \
     'rc=${PIPESTATUS[0]}' \
     'exec 3>&-' \
     'exec 2>&4 4>&-' \
-    '# Replay bash diagnostics minus the known-benign SEGV line.' \
     'grep -vE "Segmentation fault.*core dumped.*/ffmpeg" "$shellerr" >&2 || true' \
-    '# Suppress the known benign teardown SIGSEGV (libcuda dtors on musl).' \
     'if [ "$rc" = "139" ] && ! grep -qiE "(^|[^a-z])(error|cannot load|conversion failed|not found|invalid|failed|no such)" "$errfile"; then' \
     '    exit 0' \
     'fi' \
@@ -1570,11 +1485,25 @@ RUN apk add --no-cache bash && \
     > /usr/local/bin/ffmpeg-cuda-entrypoint && \
     chmod +x /usr/local/bin/ffmpeg-cuda-entrypoint
 
-# sanity tests (cannot exercise actual GPU encode without a GPU at build time)
+# sanity tests (cannot exercise actual GPU encode without a GPU at build time).
+# LD_PRELOAD set inline since the env is only declared in the final stage below.
 RUN ["/ffmpeg", "-version"]
 RUN ["/ffprobe", "-version"]
 RUN ["/ffmpeg", "-hide_banner", "-buildconf"]
 RUN /ffmpeg -hide_banner -hwaccels 2>&1 | grep -q cuda
 RUN /ffmpeg -hide_banner -encoders 2>&1 | grep -q nvenc
 RUN /ffmpeg -hide_banner -decoders 2>&1 | grep -q cuvid
+
+# clamp all files into one layer
+FROM scratch AS final-cuda2
+COPY --from=final-cuda1 / /
+
+FROM final-cuda2 AS final-cuda
+LABEL maintainer="Mattias Wadman mattias.wadman@gmail.com"
+# Default toolkit env so callers only need `--gpus all`.
+#   compute -> libcuda.so.1 ; video -> libnvcuvid + libnvidia-encode (NVENC/NVDEC) ;
+#   utility -> libnvidia-ml + nvidia-smi.
+ENV NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,video,utility \
+    LD_PRELOAD=/usr/local/lib/libnvshim.so
 ENTRYPOINT ["/usr/local/bin/ffmpeg-cuda-entrypoint"]
