@@ -304,6 +304,7 @@ Of these, **only `:8.1-cuda` keeps every codec/lib statically linked** — every
 8. **`NVIDIA_DRIVER_CAPABILITIES` defaults to `utility` only** — without `compute,video` the toolkit doesn't mount `libnvcuvid.so`/`libnvidia-encode.so`. Baked the full set into the image's `ENV`.
 9. **`-Bdynamic -lc` reorder still produced the static dlopen stub** under gcc `--toolchain=hardened` — switched to absolute-path link of `/lib/ld-musl-x86_64.so.1` (see §6, "Fix (final, robust)").
 10. **NVENC encode succeeds but exits 139 (SIGSEGV) at process teardown** — libcuda's destructors crash under musl + gcompat during `cuCtxDestroy`. The crash happens in `main()` before any atexit handler fires, so it can't be caught from inside the binary. Fixed with a tiny entrypoint wrapper that downgrades exit 139 → 0 when stderr contains no recognised error keywords. See §14.
+11. **All ffmpeg errors silently exit 0 (bad codec, bad input, bad filter)** — root caused to a `_exit` interposer in `libnvshim.so` that always called `syscall(SYS_exit_group, 0)` regardless of the status it received (or had a bug that lost the argument). Verified via an `LD_PRELOAD` `dladdr` tracer: every `_exit` call resolved to `dso=/usr/local/lib/libnvshim.so`. **Fix**: removed the `_exit`/`exit` interposers from `libnvshim.so` entirely — they were never needed for the glibc→musl ABI shim, only the original (mistaken) attempt to suppress the teardown SEGV from inside the process. Real ffmpeg exit codes (`8` for bad codec, `254` for bad input, `8` for bad filter) now propagate identically to the non-CUDA `:8.1` image. See §5c.
 
 ---
 
@@ -510,6 +511,108 @@ exit "$rc"
 ffprobe doesn't need a wrapper: it doesn't invoke encoders and rarely auto-loads
 CUDA, so it doesn't reach the crashing destructor path.
 
+### 5c. Resolved: ffmpeg silently exits 0 on every error path
+
+**Symptom**: every fatal-error invocation of the CUDA build returned exit code
+`0` to the shell, despite ffmpeg printing the correct error messages on stderr.
+Verified against the non-CUDA `:8.1` baseline:
+
+| Scenario                               | non-CUDA `:8.1` | CUDA (broken) | CUDA (fixed) |
+|----------------------------------------|-----------------|---------------|--------------|
+| `-c:v this_codec_does_not_exist`       | `8`             | `0` ❌        | `8` ✅       |
+| `-i /no/such/file.mp4`                 | `254`           | `0` ❌        | `254` ✅     |
+| `-vf this_filter_does_not_exist`       | `8`             | `0` ❌        | `8` ✅       |
+| Successful encode                      | `0`             | `0` ✅        | `0` ✅       |
+| Successful encode (post-teardown SEGV) | n/a             | `139` (raw)   | `0` (wrapped) |
+
+This was masked at first because the wrapper grew an "upgrade exit 0 → 1 when
+stderr matches a fatal-error keyword" branch. That made T3 pass with a
+plausible-looking exit `1`, but it was a workaround, not a fix — and the wrong
+exit code (`1` instead of `8`/`254`) broke any caller that switched on the
+specific code.
+
+**Root-cause discovery**: an `LD_PRELOAD` `dladdr` tracer interposing `_exit`
+revealed that on every code path — bad-codec, bad-input, even successful
+`-version` — the call to `_exit` came from `libnvshim.so`:
+
+```
+[exittrace] _exit(0) ra=0x...  dso=/usr/local/lib/libnvshim.so
+```
+
+`libnvshim.so` had been given an `_exit` interposer (and at one point an
+`exit` interposer too) as part of the earlier-but-abandoned attempt to suppress
+the teardown SIGSEGV from inside the process. The interposer always invoked
+`syscall(SYS_exit_group, 0)` — i.e. it dropped ffmpeg's real exit status on
+the floor, hard-coding `0`. None of the standard ELF / readelf / `nm` checks
+flag this: the interposer is in a separately-loaded DSO, not in `/ffmpeg`, and
+musl's PLT happily binds `_exit` to whichever DSO comes first in symbol search
+order — `LD_PRELOAD` always wins.
+
+**Fix**: drop the `_exit` (and `exit`) overrides from `libnvshim.so` entirely.
+They were never needed for any glibc→musl ABI gap (those are all the symbol
+list documented in §4 — `gnu_get_libc_version`, `__register_atfork`,
+`dlmopen`, `dlvsym`, etc.). Process-lifecycle suppression belongs in the
+out-of-process bash wrapper (§5b), where it can read the real exit status via
+`${PIPESTATUS[0]}` and pattern-match on the actual error keywords.
+
+After removing the interposers, all standard ffmpeg exit codes match the
+non-CUDA build byte-for-byte, and the wrapper script collapses back to its
+minimal form:
+
+```bash
+#!/bin/bash
+errfile=$(mktemp)
+shellerr=$(mktemp)
+trap "rm -f \"$errfile\" \"$shellerr\"" EXIT
+exec 3>&1
+exec 4>&2
+exec 2>"$shellerr"
+{ /ffmpeg "$@" 2>&1 1>&3 3>&-; } | tee "$errfile" >&4
+rc=${PIPESTATUS[0]}
+exec 3>&-
+exec 2>&4 4>&-
+grep -vE "Segmentation fault.*core dumped.*/ffmpeg" "$shellerr" >&2 || true
+# Suppress *only* the known-benign teardown SIGSEGV from libcuda dtors.
+# Real failure exit codes (1, 8, 254, ...) propagate unchanged.
+if [ "$rc" = "139" ] && ! grep -qiE "(^|[^a-z])(error|cannot load|conversion failed|not found|invalid|failed|no such)" "$errfile"; then
+    exit 0
+fi
+exit "$rc"
+```
+
+**Lesson**: `LD_PRELOAD` shims should be the *minimum* symbol set that closes
+the glibc→musl ABI gap. Any process-lifecycle hook (exit, signal, atexit) added
+to such a shim will silently apply to *every* call from the host program, not
+just the one CUDA-driver call you were trying to fix. Keep lifecycle policy
+out-of-process.
+
+**Diagnostic recipe** (reuse this for any future "wrong exit code" regression):
+
+```sh
+docker run --rm --gpus all --entrypoint sh "$IMG" -c '
+  apk add --no-cache gcc musl-dev binutils >/dev/null
+  cat > /tmp/t.c <<EOF
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <sys/syscall.h>
+__attribute__((noreturn)) void _exit(int s){
+  void *ra=__builtin_return_address(0); Dl_info i={0}; dladdr(ra,&i);
+  dprintf(2,"[trace] _exit(%d) dso=%s\n",s,i.dli_fname?i.dli_fname:"?");
+  syscall(SYS_exit_group,s); __builtin_unreachable();
+}
+EOF
+  gcc -O0 -fPIC -shared -o /tmp/t.so /tmp/t.c -ldl
+  LD_PRELOAD="/tmp/t.so:${LD_PRELOAD}" /ffmpeg -hide_banner -loglevel error \
+    -f lavfi -i testsrc=duration=1:size=320x240:rate=30 \
+    -c:v this_codec_does_not_exist -f null -
+'
+# The traced _exit must show dso=/lib/ld-musl-x86_64.so.1 (i.e. real libc),
+# NOT dso=/usr/local/lib/libnvshim.so. If it shows nvshim, the interposer
+# regression is back.
+```
+
 ### Diagnostic playbook (for future re-entry)
 
 Quick all-in-one container probe used during this investigation:
@@ -585,8 +688,8 @@ EOF
 | `-Wl,--no-as-needed,-Bdynamic,-lc,--as-needed,-Bstatic` in extra-ldflags | Still pulled `libc.a` `dlopen` stub via gcc-hardened spec file |
 | Hide `/usr/lib/libc.a` during link | libgme.a configure-time symbol checks failed (gz*/inflate*) |
 | Absolute-path `-Wl,/lib/ld-musl-x86_64.so.1` in extra-ldflags | ✅ NVENC encode finally succeeds |
-| nvshim `exit()` interpose + atexit `_exit()` | SIGSEGV happens *before* main() returns, so atexit never runs — ineffective |
-| Entrypoint wrapper translating exit 139 → 0 with error-keyword guard | ✅ Final fix; clean exit 0 with stdout/stderr passthrough preserved |
+| nvshim `exit()` interpose + atexit `_exit()` | SIGSEGV happens *before* main() returns, so atexit never runs — ineffective. **Worse**: leaving the `_exit` interposer in the shim silently swallowed *every* ffmpeg exit code (always returned 0). See §5c. |
+| Entrypoint wrapper translating exit 139 → 0 with error-keyword guard | ✅ Final fix; clean exit 0 with stdout/stderr passthrough preserved, real exit codes (8/254/…) propagate unchanged |
 
 ### Decision branch (resolved — stayed on Alpine)
 
@@ -621,7 +724,7 @@ Removing any one breaks NVENC end-to-end. They are listed in the order they take
 | 2 | **Dynamic-PIE link mode** | builder, ffmpeg link | Replaces `-fPIE -static-pie` with `-fPIE -pie`. A static-pie binary has no dynamic loader, making `dlopen` impossible by definition. |
 | 3 | **`/etc/ld-musl-x86_64.path`** | final-cuda stage | Adds `/usr/lib64`, `/usr/lib/x86_64-linux-gnu`, `/usr/lib/wsl/lib` to musl's loader search path. The NVIDIA Container Toolkit injects driver libs into one of these depending on host distro; musl's default `/lib:/usr/local/lib:/usr/lib` finds none of them. |
 | 4 | **`gcompat` package + `libdl.so.2` symlink** | final-cuda stage | Provides `libc.so.6` / `libm.so.6` / `libpthread.so.0` / `librt.so.1` as musl wrappers (the driver's `DT_NEEDED` entries). The symlink points the driver's `libdl.so.2` reference at `libgcompat.so.0` since musl folds dlopen into libc and ships no separate `libdl`. |
-| 5 | **`libnvshim.so` LD_PRELOAD** | final-cuda stage | Exports glibc-internal symbols the driver references but gcompat doesn't ship: `gnu_get_libc_version`, `__register_atfork`, `__cxa_thread_atexit_impl`, `secure_getenv`, `dlmopen`, `dlvsym`, `__libc_dlopen_mode/dlsym/dlclose`, `__libc_current_sigrtmin/max`, `__libc_single_threaded`, `gnu_get_libc_release`. Without the shim, dlopen of the WSL2 backend `libcuda.so.1.1` fails with `symbol not found` errors. |
+| 5 | **`libnvshim.so` LD_PRELOAD** | final-cuda stage | Exports glibc-internal symbols the driver references but gcompat doesn't ship: `gnu_get_libc_version`, `__register_atfork`, `__cxa_thread_atexit_impl`, `secure_getenv`, `dlmopen`, `dlvsym`, `__libc_dlopen_mode/dlsym/dlclose`, `__libc_current_sigrtmin/max`, `__libc_single_threaded`, `gnu_get_libc_release`. Without the shim, dlopen of the WSL2 backend `libcuda.so.1.1` fails with `symbol not found` errors. **Must NOT export `exit`/`_exit`/`_Exit`** — see §5c; interposing those swallows ffmpeg's real exit status. |
 | 6 | **Entrypoint wrapper** | final-cuda stage | Bash script that exec's `/ffmpeg`, captures exit code via `${PIPESTATUS[0]}`, preserves stdout byte-exact via fd-3 trick, tees stderr to a temp file, and downgrades exit 139 → 0 *only* when stderr contains no recognised error keyword. Suppresses the cosmetic libcuda-destructor SIGSEGV that fires after the encode is fully complete. |
 
 Layers 1–2 belong to the **builder stage** (link-time concerns).
@@ -714,6 +817,13 @@ docker run --rm --gpus all "$IMG" \
 # 4. ffprobe sanity (no wrapper)
 docker run --rm --gpus all --entrypoint /ffprobe "$IMG" -version >/dev/null
 echo "exit=$? (must be 0)"
+
+# 5. Exit-code parity vs non-CUDA :8.1 (regression guard for §5c)
+docker run --rm --gpus all "$IMG" -hide_banner -loglevel error \
+    -f lavfi -i testsrc=duration=1:size=320x240:rate=30 \
+    -c:v this_codec_does_not_exist -f null - ; echo "exit=$? (must be 8)"
+docker run --rm --gpus all "$IMG" -hide_banner -loglevel error \
+    -i /no/such/file.mp4 -f null - ; echo "exit=$? (must be 254)"
 ```
 
 All four must succeed for the image to be considered shippable.

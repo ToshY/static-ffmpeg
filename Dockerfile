@@ -1441,16 +1441,18 @@ RUN apk add --no-cache gcompat libstdc++ && \
 #       with "Error relocating: <sym>: symbol not found", which ffmpeg then surfaces
 #       as the misleading "Cannot load libcuda.so.1".
 #
-#   (b) interposes exit(3) so that, after all of ffmpeg's atexit cleanup has run,
-#       the process terminates via _exit(2) instead of falling through into the
-#       NVIDIA driver's DT_FINI / __cxa_finalize destructors. Those destructors
-#       SIGSEGV on musl + gcompat at teardown (libcuda's pthread_atfork-registered
-#       handlers and TLS destructors unwind through state that no longer exists),
-#       producing exit code 139 even when the encode itself succeeded and the
-#       output file was fully written. By short-circuiting to _exit() we keep the
-#       real exit status that ffmpeg wanted to return, but skip the dtors that
-#       crash. ffmpeg has already flushed all I/O via its own atexit handlers
-#       before our handler runs (atexit is LIFO; we register first via constructor).
+#   (b) [REMOVED 2026-05-03] An earlier version of this shim also interposed
+#       exit(3) and registered an atexit handler that called _exit() to skip
+#       libcuda's crashing DT_FINI destructors. That hack was structurally
+#       broken: ffmpeg's error paths return from main() with a nonzero status
+#       rather than calling exit() explicitly, so musl's _start invokes its
+#       internal exit() WITHOUT going through the PLT — bypassing our LD_PRELOAD
+#       interpose. Our atexit handler then fired with a stale saved_status of 0
+#       and clobbered every nonzero exit code (bad codec → 0, bad input → 0).
+#       The teardown SIGSEGV is now handled exclusively by the bash entrypoint
+#       wrapper at /usr/local/bin/ffmpeg-cuda-entrypoint, which converts the
+#       benign 139 to 0 only when no error keyword is present in stderr. Real
+#       failure exit codes propagate unchanged.
 #
 # Symbols covered for (a) — broadest set of glibc-internals NVIDIA driver libs are
 # known to reference; safe no-op or thin musl-redirect implementations:
@@ -1499,28 +1501,6 @@ RUN apk add --no-cache --virtual .nvshim-build gcc musl-dev && \
       'void *dlvsym(void *handle, const char *name, const char *version) {' \
       '    (void)version; return dlsym(handle, name);' \
       '}' \
-      '' \
-      '/* ---- exit() interposition: bypass DT_FINI of libcuda to avoid SIGSEGV at teardown ---- */' \
-      '/* Captured exit status set by our interposed exit(); used by the atexit handler. */' \
-      'static volatile int nvshim_saved_status = 0;' \
-      '/* Runs LAST in the atexit chain (registered FIRST from our constructor; */' \
-      '/* atexit is LIFO so all of ffmpegs handlers — stdio flush, fclose etc.   */' \
-      '/* — have already executed by the time we get here). _exit() then skips   */' \
-      '/* all DSO destructors, including libcuda.so.1s crashing __cxa_finalize. */' \
-      'static void nvshim_force_exit(void) { _exit(nvshim_saved_status); }' \
-      '__attribute__((constructor)) static void nvshim_init(void) {' \
-      '    atexit(nvshim_force_exit);' \
-      '}' \
-      '/* Interpose exit() so we capture the real status, then chain to libcs   */' \
-      '/* exit() which runs atexit handlers (ours included) in LIFO order.       */' \
-      'void exit(int status) {' \
-      '    static void (*real_exit)(int);' \
-      '    nvshim_saved_status = status;' \
-      '    if (!real_exit) real_exit = dlsym(RTLD_NEXT, "exit");' \
-      '    if (real_exit) real_exit(status);' \
-      '    _exit(status);' \
-      '    __builtin_unreachable();' \
-      '}' \
       > /tmp/nvshim.c && \
     gcc -shared -fPIC -nostartfiles -o /usr/local/lib/libnvshim.so /tmp/nvshim.c -lpthread -ldl && \
     rm /tmp/nvshim.c && \
@@ -1567,13 +1547,9 @@ ENV NVIDIA_VISIBLE_DEVICES=all \
 RUN apk add --no-cache bash && \
     printf '%s\n' \
     '#!/bin/bash' \
-    '# ffmpeg-cuda entrypoint:' \
-    '#   - swallow benign teardown SIGSEGV from libcuda dtors (139 -> 0)' \
-    '#   - upgrade silent-failure exits (0 -> 1) when ffmpeg printed a known' \
-    '#     fatal-error summary line. The CUDA build of ffmpeg currently' \
-    '#     returns exit code 0 for several real failure paths (bad encoder,' \
-    '#     bad input, bad filter); see docs/24-04-2026-ffmpeg-with-cuda.md' \
-    '#     "Known issue: silent-failure exit code".' \
+    '# ffmpeg-cuda entrypoint: swallow benign teardown SIGSEGV from libcuda dtors' \
+    '# (exit 139 -> 0) only when no error keyword appears in stderr. Real failure' \
+    '# exit codes (1, 8, 254, ...) propagate unchanged.' \
     'errfile=$(mktemp)' \
     'shellerr=$(mktemp)' \
     'trap "rm -f \"$errfile\" \"$shellerr\"" EXIT' \
@@ -1589,13 +1565,6 @@ RUN apk add --no-cache bash && \
     '# Suppress the known benign teardown SIGSEGV (libcuda dtors on musl).' \
     'if [ "$rc" = "139" ] && ! grep -qiE "(^|[^a-z])(error|cannot load|conversion failed|not found|invalid|failed|no such)" "$errfile"; then' \
     '    exit 0' \
-    'fi' \
-    '# Upgrade silent-failure exit codes. ffmpeg prints these summary lines' \
-    '# only on hard-fail paths -- never as transient warnings on successful' \
-    '# encodes. Anchored to start-of-line to avoid false positives from' \
-    '# decoder/encoder log lines like "[h264 @ ...] error decoding stream".' \
-    'if [ "$rc" = "0" ] && grep -qE "^(Error opening (input|output) files?|Conversion failed!)" "$errfile"; then' \
-    '    exit 1' \
     'fi' \
     'exit "$rc"' \
     > /usr/local/bin/ffmpeg-cuda-entrypoint && \
