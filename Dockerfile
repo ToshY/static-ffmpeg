@@ -1567,21 +1567,35 @@ ENV NVIDIA_VISIBLE_DEVICES=all \
 RUN apk add --no-cache bash && \
     printf '%s\n' \
     '#!/bin/bash' \
-    '# ffmpeg-cuda entrypoint: swallow benign teardown SIGSEGV from libcuda dtors.' \
+    '# ffmpeg-cuda entrypoint:' \
+    '#   - swallow benign teardown SIGSEGV from libcuda dtors (139 -> 0)' \
+    '#   - upgrade silent-failure exits (0 -> 1) when ffmpeg printed a known' \
+    '#     fatal-error summary line. The CUDA build of ffmpeg currently' \
+    '#     returns exit code 0 for several real failure paths (bad encoder,' \
+    '#     bad input, bad filter); see docs/24-04-2026-ffmpeg-with-cuda.md' \
+    '#     "Known issue: silent-failure exit code".' \
     'errfile=$(mktemp)' \
-    'trap "rm -f \"$errfile\"" EXIT' \
-    '# Save original stdout to fd 3 BEFORE the pipeline is set up, so ffmpegs' \
-    '# stdout (e.g. muxed bytes for `-f mp4 -`) bypasses tee and reaches the' \
-    '# users terminal/pipe unmodified. If we did `{ ...; } 3>&1 | tee`, the' \
-    '# pipe would have already replaced fd 1, and 3>&1 would point fd 3 INTO' \
-    '# the pipe -- breaking stdout passthrough.' \
+    'shellerr=$(mktemp)' \
+    'trap "rm -f \"$errfile\" \"$shellerr\"" EXIT' \
     'exec 3>&1' \
-    '{ /ffmpeg "$@" 2>&1 1>&3 3>&-; } | tee "$errfile" >&2' \
+    'exec 4>&2' \
+    'exec 2>"$shellerr"' \
+    '{ /ffmpeg "$@" 2>&1 1>&3 3>&-; } | tee "$errfile" >&4' \
     'rc=${PIPESTATUS[0]}' \
     'exec 3>&-' \
-    '# Suppress only the known benign teardown SIGSEGV (libcuda dtors on musl).' \
+    'exec 2>&4 4>&-' \
+    '# Replay bash diagnostics minus the known-benign SEGV line.' \
+    'grep -vE "Segmentation fault.*core dumped.*/ffmpeg" "$shellerr" >&2 || true' \
+    '# Suppress the known benign teardown SIGSEGV (libcuda dtors on musl).' \
     'if [ "$rc" = "139" ] && ! grep -qiE "(^|[^a-z])(error|cannot load|conversion failed|not found|invalid|failed|no such)" "$errfile"; then' \
     '    exit 0' \
+    'fi' \
+    '# Upgrade silent-failure exit codes. ffmpeg prints these summary lines' \
+    '# only on hard-fail paths -- never as transient warnings on successful' \
+    '# encodes. Anchored to start-of-line to avoid false positives from' \
+    '# decoder/encoder log lines like "[h264 @ ...] error decoding stream".' \
+    'if [ "$rc" = "0" ] && grep -qE "^(Error opening (input|output) files?|Conversion failed!)" "$errfile"; then' \
+    '    exit 1' \
     'fi' \
     'exit "$rc"' \
     > /usr/local/bin/ffmpeg-cuda-entrypoint && \
