@@ -1179,7 +1179,6 @@ RUN \
     --enable-version3 \
     $FDKAAC_FLAGS \
     $CUDA_FLAGS \
-    --enable-openssl \
     --enable-fontconfig \
     --enable-gray \
     --enable-iconv \
@@ -1236,6 +1235,7 @@ RUN \
     --enable-libxvid \
     --enable-libzimg \
     --enable-libzmq \
+    --enable-openssl \
   || (cat ffbuild/config.log ; false) && \
   make -j$(nproc) install
 
@@ -1383,7 +1383,11 @@ ENTRYPOINT ["/ffmpeg"]
 # --enable-libnpp / --enable-cuda-nvcc are NOT included (require glibc CUDA toolkit).
 # Use scale_cuda instead of scale_npp.
 FROM alpine:3.20.3 AS final-cuda1
-COPY --from=builder /usr/local/bin/ffmpeg /
+# Real ffmpeg ELF lives at /ffmpeg.bin; /ffmpeg is the bash wrapper (added below)
+# that execs it. This way `COPY --from=...:cuda /ffmpeg /ffmpeg.bin <dst>/` from
+# a downstream image gives a drop-in /ffmpeg that already includes the
+# teardown-SIGSEGV workaround — no custom ENTRYPOINT needed.
+COPY --from=builder /usr/local/bin/ffmpeg /ffmpeg.bin
 COPY --from=builder /usr/local/bin/ffprobe /
 COPY --from=builder /versions.json /
 COPY --from=builder /usr/local/share/doc/ffmpeg/* /doc/
@@ -1458,11 +1462,11 @@ RUN printf '/lib\n/usr/local/lib\n/usr/lib\n/usr/lib64\n/usr/lib/x86_64-linux-gn
     > /etc/ld-musl-x86_64.path
 
 
-# Entrypoint wrapper: convert the benign teardown SIGSEGV (139 -> 0) that
-# libcuda's __cxa_finalize triggers under musl + gcompat. The crash happens
-# inside main() after the encode is complete and all output is flushed, so
-# no in-process hook can suppress it. Heuristic: only downgrade 139 when
-# stderr contains no recognisable error keyword. Real failure exit codes
+# Entrypoint wrapper installed AS /ffmpeg itself: convert the benign teardown
+# SIGSEGV (139 -> 0) that libcuda's __cxa_finalize triggers under musl + gcompat.
+# The crash happens inside main() after the encode is complete and all output is
+# flushed, so no in-process hook can suppress it. Heuristic: only downgrade 139
+# when stderr contains no recognisable error keyword. Real failure exit codes
 # (1, 8, 254, ...) propagate unchanged. See docs/ffmpeg-with-cuda.md (P5).
 RUN apk add --no-cache bash && \
     printf '%s\n' \
@@ -1473,7 +1477,7 @@ RUN apk add --no-cache bash && \
     'exec 3>&1' \
     'exec 4>&2' \
     'exec 2>"$shellerr"' \
-    '{ /ffmpeg "$@" 2>&1 1>&3 3>&-; } | tee "$errfile" >&4' \
+    '{ /ffmpeg.bin "$@" 2>&1 1>&3 3>&-; } | tee "$errfile" >&4' \
     'rc=${PIPESTATUS[0]}' \
     'exec 3>&-' \
     'exec 2>&4 4>&-' \
@@ -1482,12 +1486,13 @@ RUN apk add --no-cache bash && \
     '    exit 0' \
     'fi' \
     'exit "$rc"' \
-    > /usr/local/bin/ffmpeg-cuda-entrypoint && \
-    chmod +x /usr/local/bin/ffmpeg-cuda-entrypoint
+    > /ffmpeg && \
+    chmod +x /ffmpeg
 
 # sanity tests (cannot exercise actual GPU encode without a GPU at build time).
-# LD_PRELOAD set inline since the env is only declared in the final stage below.
+# /ffmpeg goes through the wrapper -> /ffmpeg.bin; both must work.
 RUN ["/ffmpeg", "-version"]
+RUN ["/ffmpeg.bin", "-version"]
 RUN ["/ffprobe", "-version"]
 RUN ["/ffmpeg", "-hide_banner", "-buildconf"]
 RUN /ffmpeg -hide_banner -hwaccels 2>&1 | grep -q cuda
@@ -1506,4 +1511,4 @@ LABEL maintainer="Mattias Wadman mattias.wadman@gmail.com"
 ENV NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,video,utility \
     LD_PRELOAD=/usr/local/lib/libnvshim.so
-ENTRYPOINT ["/usr/local/bin/ffmpeg-cuda-entrypoint"]
+ENTRYPOINT ["/ffmpeg"]

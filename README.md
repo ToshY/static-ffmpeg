@@ -177,6 +177,101 @@ docker run --gpus all --rm --entrypoint=/ffmpeg my-ffmpeg-static:cuda -hide_bann
 Supported encoders: `h264_nvenc`, `hevc_nvenc`, `av1_nvenc` (GPU dependent).
 Supported decoders / hwaccel: `cuda`, `cuvid` (`h264_cuvid`, `hevc_cuvid`, …).
 
+#### Use in another image with `COPY --from`
+
+Unlike the default static binary, the CUDA variant has runtime dependencies
+beyond the binary itself. To get a working NVENC/NVDEC build in your own
+image you need to copy **all** of the following from `:8.1-cuda`:
+
+```Dockerfile
+FROM alpine:3.20
+
+# 1. The binaries. /ffmpeg in the cuda image is a bash wrapper that execs
+#    /ffmpeg.bin (the real ELF) — it downgrades the benign teardown SIGSEGV
+#    (exit 139 → 0) while preserving real ffmpeg exit codes. Both files must
+#    be copied; the wrapper expects to find /ffmpeg.bin at the same root.
+COPY --from=mwader/static-ffmpeg:8.1-cuda /ffmpeg     /ffmpeg
+COPY --from=mwader/static-ffmpeg:8.1-cuda /ffmpeg.bin /ffmpeg.bin
+COPY --from=mwader/static-ffmpeg:8.1-cuda /ffprobe    /usr/local/bin/
+
+# 2. musl loader path file — adds /usr/lib64, /usr/lib/wsl/lib, etc. so musl
+#    can find the toolkit-injected NVIDIA driver libs.
+COPY --from=mwader/static-ffmpeg:8.1-cuda /etc/ld-musl-x86_64.path /etc/ld-musl-x86_64.path
+
+# 3. The glibc → musl ABI shim (LD_PRELOAD'd into ffmpeg).
+COPY --from=mwader/static-ffmpeg:8.1-cuda /usr/local/lib/libnvshim.so /usr/local/lib/
+
+# 4. gcompat + bash + the libdl.so.2 → libgcompat.so.0 symlink the NVIDIA
+#    driver libs need at DT_NEEDED resolution time. bash is required by the
+#    /ffmpeg wrapper script.
+RUN apk add --no-cache gcompat libstdc++ bash && \
+    ln -sf /usr/lib/libgcompat.so.0 /usr/lib/libdl.so.2
+
+# 5. Toolkit env (compute → libcuda.so.1, video → libnvcuvid/libnvidia-encode).
+ENV NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility,video \
+    LD_PRELOAD=/usr/local/lib/libnvshim.so
+
+ENTRYPOINT ["/ffmpeg"]
+```
+
+Notes:
+
+- The base image **must be Alpine** (or otherwise musl-based with a compatible
+  musl major version). Glibc-based images — including `debian:*-slim`
+  (e.g. `bookworm-slim`), `ubuntu:*`, `python:*-slim`, `nvidia/cuda:*`,
+  `redhat/ubi*`, etc. — are **not** supported destinations: the binary's
+  `PT_INTERP` is `/lib/ld-musl-x86_64.so.1`, which doesn't exist on those
+  distros, and the `gcompat` shim in step 4 is Alpine-only. If you need a
+  Debian/Ubuntu runtime, run the published `mwader/static-ffmpeg:<tag>-cuda`
+  image directly (it's already Alpine-based) instead of `COPY --from`'ing
+  into a glibc base.
+- Skipping any of items 2–5 will produce a binary that builds and runs
+  `-version` fine but fails at the first NVENC/NVDEC call.
+- Run with `--gpus all` (and the NVIDIA Container Toolkit installed on the
+  host) for GPU access — same as running `mwader/static-ffmpeg:8.1-cuda`
+  directly.
+
+##### Multi-process images (Python / Node / app + ffmpeg)
+
+The example above sets `LD_PRELOAD=/usr/local/lib/libnvshim.so` as image-wide
+`ENV`. That's safe in an **ffmpeg-only** image (the published `:*-cuda` image
+runs only `/ffmpeg`, which was built and tested with the shim preloaded), but
+it is **not** safe in an image that also runs other musl binaries — `pip`,
+`python`, `node`, your app, etc. `libnvshim.so` exports glibc-only symbols and
+transitively pulls in `gcompat` (via `DT_NEEDED libdl.so.2`). Forcing that
+into every process tends to crash CPython and other musl interpreters with
+`SIGSEGV` (exit code 139) at startup.
+
+For multi-process images, scope the preload to ffmpeg only with a small
+wrapper instead of `ENV LD_PRELOAD`:
+
+```Dockerfile
+# Replace step 5's `LD_PRELOAD=...` ENV line with a wrapper that sets
+# LD_PRELOAD only for the ffmpeg process. Other processes (pip, python,
+# sh, ...) run with a clean environment. The wrapper at /usr/local/bin/ffmpeg
+# also exposes ffmpeg on PATH for your app to call as `ffmpeg`.
+RUN printf '%s\n' \
+    '#!/bin/sh' \
+    'exec env LD_PRELOAD=/usr/local/lib/libnvshim.so /ffmpeg "$@"' \
+    > /usr/local/bin/ffmpeg \
+    && chmod +x /usr/local/bin/ffmpeg
+
+ENV NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+# (no ENV LD_PRELOAD here)
+```
+
+`/usr/local/bin/ffmpeg` (the wrapper) execs `/ffmpeg` (the static-ffmpeg bash
+wrapper that downgrades the benign teardown SIGSEGV) which execs
+`/ffmpeg.bin` (the real ELF). Exit codes propagate unchanged via `exec`. Your
+app continues to call `ffmpeg` from `PATH` as normal.
+
+If you also invoke `ffprobe` against CUDA-accelerated decoders and see it
+crash, wrap it the same way (rename the copied binary to `ffprobe.bin` first
+and put the wrapper at `/usr/local/bin/ffprobe`). For most ffprobe use cases
+this isn't needed.
+
 #### Limitations
 
 - `--enable-cuda-nvcc` and `--enable-libnpp` are **not** included — they require
@@ -188,6 +283,7 @@ Supported decoders / hwaccel: `cuda`, `cuvid` (`h264_cuvid`, `hevc_cuvid`, …).
   musl libc (i.e. an Alpine-based image of the matching `musl` major version).
 - Without `--gpus all` (or without the NVIDIA Container Toolkit) the binary
   still runs but `nvenc`/`nvdec`/`cuda` initialization will fail at runtime.
+- amd64 only.
 
 ### Fonts usage with SVG or draw text filters etc
 
