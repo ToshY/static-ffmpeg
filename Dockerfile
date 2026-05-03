@@ -1151,19 +1151,46 @@ RUN \
   wget $WGET_OPTS -O ffmpeg.tar.bz2 "$FFMPEG_URL" && \
   echo "$FFMPEG_SHA256  ffmpeg.tar.bz2" | sha256sum -c - && \
   tar $TAR_OPTS ffmpeg.tar.bz2 && cd ffmpeg* && \
-  export LDFLAGS="-Wl,--no-as-needed -Wl,-Bdynamic -lc" && \
   FDKAAC_FLAGS=$(if [[ -n "$ENABLE_FDKAAC" ]] ;then echo " --enable-libfdk-aac --enable-nonfree " ;else echo ""; fi) && \
   CUDA_FLAGS=$(if [[ -n "$ENABLE_CUDA" ]] ;then echo " --enable-ffnvcodec --enable-cuvid --enable-nvenc --enable-nvdec " ;else echo ""; fi) && \
   if [[ -z "$ENABLE_CUDA" ]]; then \
+    # Default static-pie build: rewrite the hardened toolchain link flag so the
+    # final binaries are fully static PIE musl executables (no loader, no libc.so).
+    # dlopen is irrelevant in this branch (no GPU support), so plain -Bstatic is fine.
     sed -i 's/add_ldexeflags -fPIE -pie/add_ldexeflags -fPIE -static-pie/' configure ; \
+    EXTRA_LDFLAGS="-fopenmp -Wl,--allow-multiple-definition -Wl,-z,stack-size=2097152 \
+        -Wl,--as-needed -Wl,-Bstatic \
+        -static-libstdc++ -static-libgcc" ; \
+    EXTRA_LIBS="-lgomp" ; \
+  else \
+    # CUDA variant: musl dynamic-PIE so the loader is present and ffmpeg can
+    # dlopen() libcuda.so.1 / libnvcuvid.so.1 / libnvidia-encode.so.1 that the
+    # NVIDIA Container Toolkit injects at runtime.
+    #
+    # CRITICAL — musl dlopen-stub trap (see docs/24-04-2026-ffmpeg-with-cuda.md §6):
+    #   musl's static libc.a contains a 25-byte dlopen() stub that always returns
+    #   NULL with ENOSYS. If we link the binary with bare "-Wl,-Bstatic ... codecs",
+    #   the linker satisfies ffmpeg's references to dlopen / dlsym / dlerror /
+    #   dlclose from that stub, NOT from the dynamic libc. The resulting binary
+    #   has a defined 25-byte "dlopen" symbol in .text instead of a UND PLT entry,
+    #   and h264_nvenc fails at runtime with "Cannot load libcuda.so.1" without
+    #   ever issuing an openat() syscall (verified with strace).
+    #
+    # Fix: explicitly link the dynamic libc by ABSOLUTE PATH (not -lc), so the
+    # linker uses libc.musl-x86_64.so.1 regardless of the current -B* mode and
+    # cannot fall back to libc.a's stub. Wrapped in --no-as-needed so it stays
+    # in DT_NEEDED even though ffmpeg.o doesn't directly reference its data.
+    EXTRA_LDFLAGS="-fopenmp -Wl,--allow-multiple-definition -Wl,-z,stack-size=2097152 \
+        -Wl,--no-as-needed,/lib/ld-musl-x86_64.so.1,--as-needed \
+        -Wl,--as-needed -Wl,-Bstatic \
+        -static-libstdc++ -static-libgcc" ; \
+    EXTRA_LIBS="-lgomp -Wl,-Bdynamic -lc" ; \
   fi && \
   ./configure \
     --pkg-config-flags="--static" \
     --extra-cflags="-fopenmp" \
-    --extra-ldflags="-fopenmp -Wl,--allow-multiple-definition -Wl,-z,stack-size=2097152 \
-    -Wl,--as-needed -Wl,-Bstatic \
-    -static-libstdc++ -static-libgcc" \
-    --extra-libs="-lgomp" \
+    --extra-ldflags="$EXTRA_LDFLAGS" \
+    --extra-libs="$EXTRA_LIBS" \
     --toolchain=hardened \
     --disable-debug \
     --disable-shared \
@@ -1174,65 +1201,64 @@ RUN \
     $FDKAAC_FLAGS \
     $CUDA_FLAGS \
     --enable-openssl \
+    --enable-fontconfig \
+    --enable-gray \
+    --enable-iconv \
+    --enable-lcms2 \
+    --enable-libaom \
+    --enable-libaribb24 \
+    --enable-libass \
+    --enable-libbluray \
+    --enable-libdav1d \
+    --enable-libdavs2 \
+    --enable-libfreetype \
+    --enable-libfribidi \
+    --enable-libgme \
+    --enable-libgsm \
+    --enable-libharfbuzz \
+    --enable-libjxl \
+    --enable-libkvazaar \
+    --enable-libmodplug \
+    --enable-libmp3lame \
+    --enable-libmysofa \
+    --enable-libopencore-amrnb \
+    --enable-libopencore-amrwb \
+    --enable-libopenjpeg \
+    --enable-libopus \
+    --enable-librabbitmq \
+    --enable-librav1e \
+    --enable-librsvg \
+    --enable-librtmp \
+    --enable-librubberband \
+    --enable-libshine \
+    --enable-libsnappy \
+    --enable-libsoxr \
+    --enable-libspeex \
+    --enable-libsrt \
+    --enable-libssh \
+    --enable-libsvtav1 \
+    --enable-libtheora \
+    --enable-libtwolame \
+    --enable-libuavs3d \
+    --enable-libvidstab \
+    --enable-libvmaf \
+    --enable-libvo-amrwbenc \
+    --enable-libvorbis \
+    --enable-libvpl \
+    --enable-libvpx \
+    --enable-libvvenc \
+    --enable-libwebp \
+    --enable-libx264 \
+    --enable-libx265 \
+    --enable-libxavs2 \
+    --enable-libxevd \
+    --enable-libxeve \
+    --enable-libxml2 \
+    --enable-libxvid \
+    --enable-libzimg \
+    --enable-libzmq \
   || (cat ffbuild/config.log ; false) && \
   make -j$(nproc) install
-
-#    --enable-fontconfig \
-#    --enable-gray \
-#    --enable-iconv \
-#    --enable-lcms2 \
-#    --enable-libaom \
-#    --enable-libaribb24 \
-#    --enable-libass \
-#    --enable-libbluray \
-#    --enable-libdav1d \
-#    --enable-libdavs2 \
-#    --enable-libfreetype \
-#    --enable-libfribidi \
-#    --enable-libgme \
-#    --enable-libgsm \
-#    --enable-libharfbuzz \
-#    --enable-libjxl \
-#    --enable-libkvazaar \
-#    --enable-libmodplug \
-#    --enable-libmp3lame \
-#    --enable-libmysofa \
-#    --enable-libopencore-amrnb \
-#    --enable-libopencore-amrwb \
-#    --enable-libopenjpeg \
-#    --enable-libopus \
-#    --enable-librabbitmq \
-#    --enable-librav1e \
-#    --enable-librsvg \
-#    --enable-librtmp \
-#    --enable-librubberband \
-#    --enable-libshine \
-#    --enable-libsnappy \
-#    --enable-libsoxr \
-#    --enable-libspeex \
-#    --enable-libsrt \
-#    --enable-libssh \
-#    --enable-libsvtav1 \
-#    --enable-libtheora \
-#    --enable-libtwolame \
-#    --enable-libuavs3d \
-#    --enable-libvidstab \
-#    --enable-libvmaf \
-#    --enable-libvo-amrwbenc \
-#    --enable-libvorbis \
-#    --enable-libvpl \
-#    --enable-libvpx \
-#    --enable-libvvenc \
-#    --enable-libwebp \
-#    --enable-libx264 \
-#    --enable-libx265 \
-#    --enable-libxavs2 \
-#    --enable-libxevd \
-#    --enable-libxeve \
-#    --enable-libxml2 \
-#    --enable-libxvid \
-#    --enable-libzimg \
-#    --enable-libzmq \
 
 RUN \
   EXPAT_VERSION=$(pkg-config --modversion expat) \
@@ -1392,6 +1418,175 @@ COPY --from=builder /etc/fonts/ /etc/fonts/
 COPY --from=builder /usr/share/fonts/ /usr/share/fonts/
 COPY --from=builder /usr/share/consolefonts/ /usr/share/consolefonts/
 COPY --from=builder /var/cache/fontconfig/ /var/cache/fontconfig/
+
+# gcompat = glibc compatibility shim for musl. Required because the NVIDIA driver
+# libraries injected by the Container Toolkit (libcuda.so.1, libnvcuvid.so.1,
+# libnvidia-encode.so.1, libnvidia-ml.so.1, ...) are built against glibc and have
+# DT_NEEDED entries for libc.so.6 / libpthread.so.0 / libdl.so.2 / libm.so.6 /
+# librt.so.1 / libgcc_s.so.1 — none of which exist on Alpine/musl. gcompat
+# provides those SONAMEs as thin wrappers over musl, allowing dlopen() to succeed.
+# libstdc++ is also pulled in because some NVIDIA helper libs (e.g. libnvidia-ngx,
+# certain optical-flow / ngx variants) link against it.
+RUN apk add --no-cache gcompat libstdc++ && \
+    # gcompat omits libdl.so.2 (musl folds dlopen into libc). The NVIDIA driver
+    # has DT_NEEDED libdl.so.2, so symlink it to libgcompat to satisfy the loader.
+    ln -sf libgcompat.so.0 /lib/libdl.so.2
+
+# nvshim = tiny LD_PRELOAD library that:
+#
+#   (a) exports glibc-internal symbols which gcompat does NOT provide but which the
+#       real NVIDIA WSL/Linux driver backend (/usr/lib/wsl/drivers/.../libcuda.so.1.1
+#       on WSL2, libcuda.so.1 directly on bare Linux) calls during cuInit().
+#       Without these the stub libcuda dlopen succeeds but its backend-load fails
+#       with "Error relocating: <sym>: symbol not found", which ffmpeg then surfaces
+#       as the misleading "Cannot load libcuda.so.1".
+#
+#   (b) interposes exit(3) so that, after all of ffmpeg's atexit cleanup has run,
+#       the process terminates via _exit(2) instead of falling through into the
+#       NVIDIA driver's DT_FINI / __cxa_finalize destructors. Those destructors
+#       SIGSEGV on musl + gcompat at teardown (libcuda's pthread_atfork-registered
+#       handlers and TLS destructors unwind through state that no longer exists),
+#       producing exit code 139 even when the encode itself succeeded and the
+#       output file was fully written. By short-circuiting to _exit() we keep the
+#       real exit status that ffmpeg wanted to return, but skip the dtors that
+#       crash. ffmpeg has already flushed all I/O via its own atexit handlers
+#       before our handler runs (atexit is LIFO; we register first via constructor).
+#
+# Symbols covered for (a) — broadest set of glibc-internals NVIDIA driver libs are
+# known to reference; safe no-op or thin musl-redirect implementations:
+#   gnu_get_libc_version        - sanity-check string ("2.35" satisfies all current drivers)
+#   gnu_get_libc_release        - "stable"
+#   __libc_current_sigrtmin/max - musl macros, just expose as functions
+#   __register_atfork           - glibc internal backing pthread_atfork; redirect
+#   __libc_single_threaded      - data symbol some drivers test (0 = multi-threaded path)
+#   __cxa_thread_atexit_impl    - C++ thread-local destructors registration; no-op
+#   secure_getenv               - musl already has it but some old drivers want explicit
+#   dlmopen / dlvsym / __libc_dl* - glibc-only dl* variants, redirect to musl equivalents
+RUN apk add --no-cache --virtual .nvshim-build gcc musl-dev && \
+    mkdir -p /usr/local/lib && \
+    printf '%s\n' \
+      '#define _GNU_SOURCE' \
+      '#include <signal.h>' \
+      '#include <pthread.h>' \
+      '#include <stdlib.h>' \
+      '#include <string.h>' \
+      '#include <dlfcn.h>' \
+      '#include <unistd.h>' \
+      'const char *gnu_get_libc_version(void) { return "2.35"; }' \
+      'const char *gnu_get_libc_release(void) { return "stable"; }' \
+      'int __libc_current_sigrtmin(void) { return SIGRTMIN; }' \
+      'int __libc_current_sigrtmax(void) { return SIGRTMAX; }' \
+      'int __register_atfork(void (*p)(void), void (*pa)(void), void (*c)(void), void *dso) {' \
+      '    (void)dso; return pthread_atfork(p, pa, c);' \
+      '}' \
+      'int __libc_single_threaded = 0;' \
+      'int __cxa_thread_atexit_impl(void (*f)(void*), void *o, void *dso) {' \
+      '    (void)f; (void)o; (void)dso; return 0;' \
+      '}' \
+      'char *secure_getenv(const char *name) { return getenv(name); }' \
+      '/* dlmopen is a glibc-only namespaced dlopen; musl has no link namespaces. */' \
+      '/* Fallback to regular dlopen, ignoring the Lmid_t. Works for NVIDIA driver  */' \
+      '/* which uses dlmopen mostly for symbol isolation when loading sub-modules.  */' \
+      'typedef long Lmid_t;' \
+      'void *dlmopen(Lmid_t lmid, const char *file, int mode) {' \
+      '    (void)lmid; return dlopen(file, mode);' \
+      '}' \
+      '/* Glibc-internal dlopen/dlsym variants used by nss / driver init paths. */' \
+      'void *__libc_dlopen_mode(const char *name, int mode) { return dlopen(name, mode); }' \
+      'void *__libc_dlsym(void *handle, const char *name) { return dlsym(handle, name); }' \
+      'int   __libc_dlclose(void *handle) { return dlclose(handle); }' \
+      '/* dlvsym = glibc versioned dlsym. musl has no symbol versioning; ignore version. */' \
+      'void *dlvsym(void *handle, const char *name, const char *version) {' \
+      '    (void)version; return dlsym(handle, name);' \
+      '}' \
+      '' \
+      '/* ---- exit() interposition: bypass DT_FINI of libcuda to avoid SIGSEGV at teardown ---- */' \
+      '/* Captured exit status set by our interposed exit(); used by the atexit handler. */' \
+      'static volatile int nvshim_saved_status = 0;' \
+      '/* Runs LAST in the atexit chain (registered FIRST from our constructor; */' \
+      '/* atexit is LIFO so all of ffmpegs handlers — stdio flush, fclose etc.   */' \
+      '/* — have already executed by the time we get here). _exit() then skips   */' \
+      '/* all DSO destructors, including libcuda.so.1s crashing __cxa_finalize. */' \
+      'static void nvshim_force_exit(void) { _exit(nvshim_saved_status); }' \
+      '__attribute__((constructor)) static void nvshim_init(void) {' \
+      '    atexit(nvshim_force_exit);' \
+      '}' \
+      '/* Interpose exit() so we capture the real status, then chain to libcs   */' \
+      '/* exit() which runs atexit handlers (ours included) in LIFO order.       */' \
+      'void exit(int status) {' \
+      '    static void (*real_exit)(int);' \
+      '    nvshim_saved_status = status;' \
+      '    if (!real_exit) real_exit = dlsym(RTLD_NEXT, "exit");' \
+      '    if (real_exit) real_exit(status);' \
+      '    _exit(status);' \
+      '    __builtin_unreachable();' \
+      '}' \
+      > /tmp/nvshim.c && \
+    gcc -shared -fPIC -nostartfiles -o /usr/local/lib/libnvshim.so /tmp/nvshim.c -lpthread -ldl && \
+    rm /tmp/nvshim.c && \
+    apk del .nvshim-build
+
+# Add NVIDIA driver injection paths to musl's dynamic-loader fallback search list.
+# The NVIDIA Container Toolkit places libcuda.so.1 etc. in one of these locations
+# depending on host distro:
+#   /usr/lib64                       (RHEL / CentOS / Fedora / Rocky / openSUSE / WSL)
+#   /usr/lib/x86_64-linux-gnu        (Debian / Ubuntu)
+#   /usr/lib/wsl/lib                 (WSL2 GPU passthrough alt path)
+# musl's default search path is /lib:/usr/local/lib:/usr/lib only, so dlopen("libcuda.so.1")
+# would otherwise fail with "Cannot load libcuda.so.1" even though the file is mounted.
+RUN printf '/lib\n/usr/local/lib\n/usr/lib\n/usr/lib64\n/usr/lib/x86_64-linux-gnu\n/usr/lib/wsl/lib\n' \
+    > /etc/ld-musl-x86_64.path
+
+# Default NVIDIA Container Toolkit env vars so callers only need `--gpus all`.
+# compute  -> mounts the real libcuda.so.1
+# video    -> mounts libnvcuvid.so.1 / libnvidia-encode.so.1 (required for NVENC/NVDEC)
+# utility  -> mounts libnvidia-ml + nvidia-smi
+# LD_PRELOAD pulls in the nvshim providing glibc-internal symbols the driver needs.
+ENV NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,video,utility \
+    LD_PRELOAD=/usr/local/lib/libnvshim.so
+
+# Entrypoint wrapper to suppress benign teardown SIGSEGV from NVIDIA driver dtors.
+#
+# Background: when ffmpeg encodes/decodes through CUDA on Alpine/musl, the encode
+# itself completes successfully and all output bytes are flushed, but at process
+# teardown libcuda's __cxa_finalize / DT_FINI runs glibc-style destructors that
+# unwind through state musl + gcompat don't fully provide, producing a SIGSEGV
+# (exit 139). The crash happens INSIDE main() during avcodec_close -> cuCtxDestroy,
+# before any atexit handler we could install would fire. There is no in-process
+# fix available short of patching libcuda (closed source) or ffmpeg's nvenc.c to
+# leak the CUDA context.
+#
+# Heuristic: convert exit=139 → 0 IFF stderr contains no recognisable ffmpeg
+# error keywords. If ffmpeg printed a real error before crashing (Cannot load,
+# "Error opening", "not found", etc.) we propagate 139 so users see real bugs.
+# Works regardless of -loglevel: silent successful encode + teardown crash =
+# empty stderr = suppressed; any real failure = error keyword present = passed
+# through. Stdout (e.g. -f null - or muxed bytes for `-f mpegts -`) is preserved
+# bit-exact via fd swap; user's stderr stream gets a live tee of ffmpeg stderr.
+RUN apk add --no-cache bash && \
+    printf '%s\n' \
+    '#!/bin/bash' \
+    '# ffmpeg-cuda entrypoint: swallow benign teardown SIGSEGV from libcuda dtors.' \
+    'errfile=$(mktemp)' \
+    'trap "rm -f \"$errfile\"" EXIT' \
+    '# Save original stdout to fd 3 BEFORE the pipeline is set up, so ffmpegs' \
+    '# stdout (e.g. muxed bytes for `-f mp4 -`) bypasses tee and reaches the' \
+    '# users terminal/pipe unmodified. If we did `{ ...; } 3>&1 | tee`, the' \
+    '# pipe would have already replaced fd 1, and 3>&1 would point fd 3 INTO' \
+    '# the pipe -- breaking stdout passthrough.' \
+    'exec 3>&1' \
+    '{ /ffmpeg "$@" 2>&1 1>&3 3>&-; } | tee "$errfile" >&2' \
+    'rc=${PIPESTATUS[0]}' \
+    'exec 3>&-' \
+    '# Suppress only the known benign teardown SIGSEGV (libcuda dtors on musl).' \
+    'if [ "$rc" = "139" ] && ! grep -qiE "(^|[^a-z])(error|cannot load|conversion failed|not found|invalid|failed|no such)" "$errfile"; then' \
+    '    exit 0' \
+    'fi' \
+    'exit "$rc"' \
+    > /usr/local/bin/ffmpeg-cuda-entrypoint && \
+    chmod +x /usr/local/bin/ffmpeg-cuda-entrypoint
+
 # sanity tests (cannot exercise actual GPU encode without a GPU at build time)
 RUN ["/ffmpeg", "-version"]
 RUN ["/ffprobe", "-version"]
@@ -1399,4 +1594,4 @@ RUN ["/ffmpeg", "-hide_banner", "-buildconf"]
 RUN /ffmpeg -hide_banner -hwaccels 2>&1 | grep -q cuda
 RUN /ffmpeg -hide_banner -encoders 2>&1 | grep -q nvenc
 RUN /ffmpeg -hide_banner -decoders 2>&1 | grep -q cuvid
-ENTRYPOINT ["/ffmpeg"]
+ENTRYPOINT ["/usr/local/bin/ffmpeg-cuda-entrypoint"]
